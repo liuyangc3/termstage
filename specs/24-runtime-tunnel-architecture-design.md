@@ -1,0 +1,342 @@
+# 24-runtime-tunnel-architecture: Embedded Runtime Tunnel Layers
+
+Status: draft v1
+Owner: termstage
+Last updated: 2026-05-26
+Depends on: [10-browser-terminal-protocol-design.md](./10-browser-terminal-protocol-design.md),
+[11-browser-terminal-runtime-design.md](./11-browser-terminal-runtime-design.md),
+[20-browser-terminal-web-design.md](./20-browser-terminal-web-design.md),
+[23-local-remote-command-lease-design.md](./23-local-remote-command-lease-design.md)
+
+## 1. Purpose
+
+This spec defines a three-layer communication architecture between the embedded
+web server and the PTY runtime while keeping `termstage` as one process. It is a
+refactor of the internal communication boundary, not a process split.
+
+The current CLI remains the user contract. The main `termstage` command still
+starts the embedded web server, runtime, and browser launch flow. Existing flags
+keep their current meaning:
+
+- `--mode shell`
+- `--command`
+- `--command-arg`
+- `--attach-local-terminal`
+- `--open`
+- `--base-path`
+- public exposure flags
+
+## 2. Scope
+
+In scope:
+
+- Introduce an explicit tunnel protocol between web-side routing and
+  `RuntimeSession`.
+- Keep `RuntimeSession` / `SessionActor` as the PTY and child-process owner.
+- Keep browser-facing routes and CLI behavior compatible with today.
+- Add WebSocket as the first transport implementation.
+- Make future transports possible without changing `SessionActor`.
+
+Out of scope:
+
+- Splitting the embedded web server into a standalone process.
+- Creating `termstage-web` or `termstage-agent` binaries.
+- EKS deployment, OIDC, Okta, multi-tenant auth, or public gateway routing.
+- Agent Sandbox integration.
+- HA registry or cross-process session discovery.
+
+Those process, deployment, and identity topics belong in a later spec that builds
+on this tunnel boundary.
+
+## 3. Architecture
+
+The design has three layers:
+
+```text
+RuntimeSession / SessionActor
+        ▲
+        │ RuntimeCommand / ClientOutput
+        ▼
+Runtime Tunnel Bridge
+        ▲
+        │ TunnelFrame
+        ▼
+Tunnel Transport
+        ▲
+        │ WebSocket / TCP / gRPC / QUIC
+        ▼
+Embedded web tunnel endpoint
+```
+
+Layer responsibilities:
+
+| Layer | Rust surface | Responsibility | Must not own |
+| --- | --- | --- | --- |
+| Runtime | `RuntimeSession`, `SessionActor`, `RuntimeCommand`, `ClientOutput` | PTY, child process, replay, resize, input lease, process exit. | WebSocket, TCP, auth, routing, reconnect policy. |
+| Tunnel protocol | `TunnelFrame`, `TunnelControl`, `RuntimeTunnelBridge` | Stable semantic frame model between web side and runtime side. | Socket implementation details. |
+| Transport | `TunnelTransport`, `TunnelCodec` | Bidirectional frame IO, encode/decode, heartbeat, close/error mapping, connection-edge backpressure. | PTY state, browser authorization, runtime lease semantics. |
+
+The first implementation keeps all components in one process:
+
+```text
+single `termstage` process
+
+┌────────────────────────────────────────────────────────────────────┐
+│ Embedded web server                                                 │
+│                                                                    │
+│  Browser /ws ◀──── route by session/controller ────▶ /tunnel/ws    │
+└──────────────────────────────────────▲─────────────────────────────┘
+                                       │ loopback WebSocket transport
+┌──────────────────────────────────────┴─────────────────────────────┐
+│ Local tunnel client / RuntimeTunnelBridge                           │
+│ - WebSocket transport implementation                                │
+│ - TunnelFrame encode/decode                                         │
+│ - TunnelFrame <-> RuntimeCommand / ClientOutput                     │
+└──────────────────────────────────────▲─────────────────────────────┘
+                                       │ in-process runtime commands
+┌──────────────────────────────────────┴─────────────────────────────┐
+│ RuntimeSession / SessionActor                                       │
+│ - PTY                                                               │
+│ - command child                                                     │
+│ - replay                                                            │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+`SessionActor` must not depend on WebSocket, TCP, gRPC, protobuf, HTTP, or any
+transport crate. It continues to receive `RuntimeCommand` and emit
+`ClientOutput`. The bridge owns translation between the runtime model and the
+tunnel frame model.
+
+## 4. Tunnel Protocol
+
+`TunnelFrame` is the stable protocol between the web side and runtime side.
+Transports and codecs can change, but frame semantics must remain stable.
+
+| Direction | Frame | Runtime mapping | Purpose |
+| --- | --- | --- | --- |
+| Runtime side -> Web side | `registerSession` | Startup metadata | Announces session id, command metadata, initial size, capabilities. |
+| Web side -> Runtime side | `attachBrowser` | `RuntimeCommand::AttachClient` | Starts routing one browser controller to the runtime. |
+| Web side -> Runtime side | `detachBrowser` | `RuntimeCommand::DetachClient` | Removes a browser client. |
+| Web side -> Runtime side | `browserInput` | `RuntimeCommand::Input` | Browser terminal bytes. |
+| Web side -> Runtime side | `browserResize` | `RuntimeCommand::BrowserResize` | Browser size proposal. |
+| Runtime side -> Web side | `ptyOutput` | `ClientOutput::Bytes` | Raw PTY output bytes. |
+| Runtime side -> Web side | `runtimeControl` | `ClientOutput::Control` / `Closed` | `ready`, `leaseChanged`, `sizeChanged`, `processExited`, warnings, errors, close reasons. |
+| Either | `heartbeat` | Transport liveness | Liveness, backpressure, and reconnect detection. |
+
+All external input to the tunnel protocol is hostile until validated:
+
+- session ids and client ids are bounded and validated before use;
+- control frame strings have byte caps;
+- terminal payloads have frame size caps;
+- unknown frame variants are rejected;
+- malformed frames close only the affected tunnel, not the runtime process.
+
+## 5. Transport and Codec
+
+The transport abstraction is intentionally narrow:
+
+```rust
+trait TunnelTransport {
+    async fn send(&mut self, frame: TunnelFrame) -> Result<(), TunnelError>;
+    async fn recv(&mut self) -> Result<Option<TunnelFrame>, TunnelError>;
+}
+
+trait TunnelCodec {
+    fn encode(&self, frame: TunnelFrame) -> Result<TunnelPayload, TunnelError>;
+    fn decode(&self, payload: TunnelPayload) -> Result<TunnelFrame, TunnelError>;
+}
+```
+
+The first implementation is WebSocket:
+
+- text frames carry JSON control frames;
+- binary frames carry terminal payload frames where that avoids unnecessary
+  encoding overhead;
+- ping/pong or explicit `heartbeat` frames provide liveness;
+- close codes map to typed `TunnelError` / runtime close reasons.
+
+Future TCP, gRPC/protobuf, or QUIC transports must implement the same
+`TunnelFrame` semantics. They must not require changes inside `SessionActor`.
+
+## 6. Runtime Tunnel Bridge
+
+`RuntimeTunnelBridge` is the only component allowed to translate between
+`TunnelFrame` and runtime commands.
+
+Runtime-bound mapping:
+
+| Tunnel frame | Runtime command |
+| --- | --- |
+| `attachBrowser` | `RuntimeCommand::AttachClient` with a bridge-owned output mailbox. |
+| `detachBrowser` | `RuntimeCommand::DetachClient`. |
+| `browserInput` | `RuntimeCommand::Input`. |
+| `browserResize` | `RuntimeCommand::BrowserResize`. |
+| tunnel close | `RuntimeCommand::DetachClient` for attached clients. |
+
+Web-bound mapping:
+
+| Runtime output | Tunnel frame |
+| --- | --- |
+| `ClientOutput::Bytes` | `ptyOutput`. |
+| `ClientOutput::Control` | `runtimeControl`. |
+| `ClientOutput::Closed` | `runtimeControl` close reason followed by transport close. |
+
+The bridge owns:
+
+- one or more runtime client mailboxes;
+- tunnel send/receive tasks;
+- bounded queues on both directions;
+- mapping between browser `ClientId` and tunnel stream/controller state;
+- shutdown propagation between transport close and runtime detach.
+
+The bridge must not own:
+
+- PTY state;
+- replay buffer;
+- child process lifecycle;
+- browser token validation;
+- HTTP route mounting.
+
+## 7. Embedded Web Server Changes
+
+The embedded web server remains started by the main command. It adds a web-side
+tunnel endpoint while preserving the existing browser-facing UX.
+
+Required behavior:
+
+1. Browser URL shape remains compatible with today.
+2. Browser `/ws` still accepts the existing browser protocol.
+3. Browser input/output is routed through the tunnel hub instead of directly
+   sending `RuntimeCommand` to `RuntimeSession`.
+4. A local tunnel client dials the embedded tunnel endpoint over loopback
+   WebSocket during startup.
+5. `--base-path` applies consistently to browser routes and tunnel routes.
+6. Public exposure validation remains unchanged.
+
+The web-side tunnel hub depends on `TunnelFrame`, not on runtime internals. This
+is the boundary that a later split-process spec can reuse.
+
+## 8. Backpressure and Shutdown
+
+Backpressure rules:
+
+- Browser -> web mailbox remains bounded.
+- Web -> tunnel transport queue remains bounded.
+- Tunnel -> bridge queue remains bounded.
+- Bridge -> runtime command channel remains bounded.
+- Runtime -> bridge output mailbox remains bounded.
+- Slow browser clients are closed without killing the runtime child.
+
+Shutdown rules:
+
+- Browser disconnect detaches only that browser client.
+- Tunnel transport close detaches attached browser clients.
+- Runtime child exit is reported as `runtimeControl`.
+- Main process shutdown closes browser sockets, tunnel transport, bridge tasks,
+  and finally `RuntimeSession`.
+- Dropping `RuntimeSession` remains the final PTY cleanup guard.
+
+## 9. Implementation Plan
+
+This is a refactor plan for embedded mode.
+
+### Phase 1: Protocol Types
+
+- Add `TunnelFrame`, `TunnelControl`, `TunnelPayload`, and `TunnelError`.
+- Add validation constructors for ids, string fields, payload caps, and unknown
+  variants.
+- Add JSON codec tests for valid and invalid frames.
+
+Exit criteria:
+
+- No runtime or web behavior changes.
+- Unit tests cover encode/decode and validation failure cases.
+
+### Phase 2: Runtime Bridge
+
+- Add `RuntimeTunnelBridge`.
+- Translate `TunnelFrame` to `RuntimeCommand`.
+- Translate `ClientOutput` to `TunnelFrame`.
+- Keep `SessionActor` unchanged and transport-agnostic.
+
+Exit criteria:
+
+- Unit tests cover bridge mappings in both directions.
+- Existing direct web/runtime path still works.
+
+### Phase 3: WebSocket Transport
+
+- Implement `TunnelTransport` for WebSocket.
+- Add the embedded tunnel route, for example `/tunnel/ws`.
+- Start a loopback local tunnel client from the main command after the web server
+  binds.
+
+Exit criteria:
+
+- One browser session can drive a shell command through:
+
+```text
+browser /ws
+  -> embedded web tunnel hub
+  -> loopback WebSocket transport
+  -> RuntimeTunnelBridge
+  -> RuntimeSession
+```
+
+- PTY output returns through the reverse path and renders in xterm.js.
+
+### Phase 4: Replace Direct Web Runtime Path
+
+- Route browser attach/input/resize/detach through `TunnelFrame`.
+- Remove direct web-server dependency on `RuntimeCommand` where no longer needed.
+- Keep CLI flags and launch behavior unchanged.
+
+Exit criteria:
+
+- Browser refresh replay, resize, process-exit notification, and input lease
+  behavior match the direct-channel implementation.
+- Existing browser tests pass through the tunnel path.
+
+## 10. AGENTS.md Binding
+
+- Error handling: tunnel errors use `thiserror`; binaries add `anyhow::Context`.
+- Async/concurrency: bridge and transport use bounded channels and explicit
+  shutdown. Spawned tasks are joined or deliberately supervised.
+- Type design: `TunnelFrame`, `TunnelTransport`, `TunnelCodec`, and
+  `RuntimeTunnelBridge` encode invariants in types.
+- Safety/security: no `unsafe`; reject malformed external frames at decode time;
+  cap all string and byte payloads.
+- Serialization: control frames use `serde`, `camelCase`, and
+  `deny_unknown_fields`.
+- Testing: unit tests for frame validation and bridge mappings; integration tests
+  for embedded web server plus loopback tunnel client.
+- Observability: structured `tracing` spans for tunnel connect, attach, detach,
+  frame validation failure, backpressure close, and shutdown.
+- Performance: use `Bytes` for terminal payloads and avoid copying terminal data
+  through JSON.
+- Documentation: public tunnel types document lifecycle and failure modes with
+  `# Errors`.
+
+## 11. Open Questions
+
+- What exact JSON/binary envelope should WebSocket use so terminal bytes remain
+  efficient while control frames stay debuggable?
+- Should tunnel mode be an internal default immediately, or initially hidden
+  behind a development flag until parity is proven?
+- Should the embedded tunnel endpoint be `/tunnel/ws`, `/runtime/ws`, or another
+  name that does not imply a separate process yet?
+- How should browser `ClientId` map to tunnel stream ids if future transports
+  multiplex multiple browser clients over one tunnel?
+
+## 12. Cross-References
+
+- Depends on: [10-browser-terminal-protocol-design.md](./10-browser-terminal-protocol-design.md),
+  [11-browser-terminal-runtime-design.md](./11-browser-terminal-runtime-design.md),
+  [20-browser-terminal-web-design.md](./20-browser-terminal-web-design.md),
+  [23-local-remote-command-lease-design.md](./23-local-remote-command-lease-design.md).
+- Consumed by future updates to:
+  [50-browser-terminal-cli-design.md](./50-browser-terminal-cli-design.md),
+  [70-browser-terminal-security-design.md](./70-browser-terminal-security-design.md),
+  [72-browser-terminal-verification-plan.md](./72-browser-terminal-verification-plan.md),
+  [90-browser-terminal-roadmap.md](./90-browser-terminal-roadmap.md),
+  [91-browser-terminal-impl-plan.md](./91-browser-terminal-impl-plan.md).

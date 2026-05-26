@@ -1,14 +1,13 @@
 # Documentation Index
 
 Status: draft v1
-Last updated: 2026-05-26
+Last updated: 2026-05-19
 
 ## Research
 
 | Document | Purpose |
 | --- | --- |
 | [browser-terminal-phase-0-validation.md](./research/browser-terminal-phase-0-validation.md) | Phase 0 validation of PTY, xterm/Vite, Axum WebSocket, and asset bundling assumptions. |
-| [survey-teleport-gateway-agent.md](./research/survey-teleport-gateway-agent.md) | Teleport-style gateway/agent prior art for splitting termstage into web gateway and private agents. |
 
 ## Guides
 
@@ -33,4 +32,3 @@ Last updated: 2026-05-26
 | 文档 | 内容 |
 | --- | --- |
 | [Phase 0 验证记录](./research/browser-terminal-phase-0-validation.md) | 记录 PTY、xterm/Vite、Axum WebSocket 和资源构建方案的前期验证结果。 |
-| [Teleport gateway/agent 调研](./research/survey-teleport-gateway-agent.md) | 记录将 termstage 拆分为公网 gateway 和私有 agent 时参考的 Teleport 风格架构。 |
