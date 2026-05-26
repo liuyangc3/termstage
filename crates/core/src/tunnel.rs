@@ -11,10 +11,13 @@ use std::fmt::{self, Debug, Formatter};
 use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
+use tokio::sync::mpsc::{self as tokio_mpsc, error::SendError};
 
 use crate::{
     protocol::{HeartbeatSequence, SafeMessage, ServerControlMessage, SessionName, TerminalSize},
-    runtime::{ClientId, ClientOutput, RuntimeCommand, ShutdownReason},
+    runtime::{
+        ClientId, ClientOutput, ClientOutputRx, RuntimeCommand, RuntimeSession, ShutdownReason,
+    },
 };
 
 const TUNNEL_TERMINAL_PAYLOAD_MAX_BYTES: usize = 64 * 1024;
@@ -31,6 +34,12 @@ pub enum TunnelError {
     /// The payload kind is not supported by this codec.
     #[error("unsupported tunnel payload for codec")]
     UnsupportedPayload,
+    /// The tunnel transport closed.
+    #[error("tunnel transport closed")]
+    TransportClosed,
+    /// Sending a runtime command failed because the runtime stopped.
+    #[error("runtime command channel closed")]
+    RuntimeCommandChannelClosed,
 }
 
 /// Bounded terminal bytes carried by tunnel frames.
@@ -254,17 +263,17 @@ impl TunnelCodec for JsonTunnelCodec {
     }
 }
 
-/// Synchronous boundary for concrete tunnel transports.
-///
-/// Async transports can implement this boundary with internal tasks and bounded
-/// channels while keeping runtime code independent from socket implementations.
+// Native async trait methods keep transport implementations readable and match
+// AGENTS.md guidance. This trait is crate-owned and not used for dyn dispatch.
+#[allow(async_fn_in_trait)]
+/// Boundary for concrete tunnel transports.
 pub trait TunnelTransport: Debug + Send {
     /// Sends one semantic frame through the transport.
     ///
     /// # Errors
     ///
     /// Returns [`TunnelError`] when the transport cannot send the frame.
-    fn send_frame(&mut self, frame: TunnelFrame) -> Result<(), TunnelError>;
+    async fn send_frame(&mut self, frame: TunnelFrame) -> Result<(), TunnelError>;
 
     /// Receives one semantic frame from the transport.
     ///
@@ -272,7 +281,7 @@ pub trait TunnelTransport: Debug + Send {
     ///
     /// Returns [`TunnelError`] when the transport cannot decode or receive a
     /// frame.
-    fn receive_frame(&mut self) -> Result<Option<TunnelFrame>, TunnelError>;
+    async fn receive_frame(&mut self) -> Result<Option<TunnelFrame>, TunnelError>;
 }
 
 /// Runtime-side action produced from a tunnel frame.
@@ -293,7 +302,134 @@ pub enum RuntimeTunnelAction {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RuntimeTunnelBridge;
 
+/// Runtime tunnel bridge completion reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeTunnelBridgeOutcome {
+    /// The transport closed cleanly.
+    TransportClosed,
+    /// The runtime output stream closed.
+    RuntimeStopped,
+}
+
+#[derive(Debug)]
+struct AttachedRuntimeClient {
+    client_id: ClientId,
+    output: ClientOutputRx,
+}
+
 impl RuntimeTunnelBridge {
+    /// Runs the bridge loop between one tunnel transport and a runtime session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TunnelError`] when transport IO fails, a tunnel payload is
+    /// invalid, or the runtime command channel has stopped.
+    pub async fn run<T>(
+        mut transport: T,
+        commands: tokio_mpsc::Sender<RuntimeCommand>,
+    ) -> Result<RuntimeTunnelBridgeOutcome, TunnelError>
+    where
+        T: TunnelTransport,
+    {
+        let mut attached: Option<AttachedRuntimeClient> = None;
+        loop {
+            let outcome = if let Some(mut client) = attached.take() {
+                tokio::select! {
+                    frame = transport.receive_frame() => {
+                        attached = Some(client);
+                        Self::handle_transport_frame(frame?, &commands, &mut attached).await?
+                    }
+                    output = client.output.recv() => {
+                        let client_id = client.client_id;
+                        attached = Some(client);
+                        Self::handle_runtime_output(output, client_id, &mut transport).await?
+                    }
+                }
+            } else {
+                let frame = transport.receive_frame().await?;
+                Self::handle_transport_frame(frame, &commands, &mut attached).await?
+            };
+
+            if let Some(outcome) = outcome {
+                return Ok(outcome);
+            }
+        }
+    }
+
+    async fn handle_transport_frame(
+        frame: Option<TunnelFrame>,
+        commands: &tokio_mpsc::Sender<RuntimeCommand>,
+        attached: &mut Option<AttachedRuntimeClient>,
+    ) -> Result<Option<RuntimeTunnelBridgeOutcome>, TunnelError> {
+        let Some(frame) = frame else {
+            if let Some(client) = attached.take() {
+                Self::send_runtime_command(
+                    commands,
+                    RuntimeCommand::DetachClient {
+                        client_id: client.client_id,
+                    },
+                )
+                .await?;
+            }
+            return Ok(Some(RuntimeTunnelBridgeOutcome::TransportClosed));
+        };
+
+        match Self::action_from_frame(frame) {
+            RuntimeTunnelAction::AttachBrowser { client_id } => {
+                let (output_tx, output_rx) = RuntimeSession::client_mailbox();
+                Self::send_runtime_command(commands, Self::attach_command(client_id, output_tx))
+                    .await?;
+                *attached = Some(AttachedRuntimeClient {
+                    client_id,
+                    output: output_rx,
+                });
+            }
+            RuntimeTunnelAction::Command(command) => {
+                if let RuntimeCommand::DetachClient { client_id } = command
+                    && attached
+                        .as_ref()
+                        .is_some_and(|client| client.client_id == client_id)
+                {
+                    *attached = None;
+                }
+                Self::send_runtime_command(commands, command).await?;
+            }
+            RuntimeTunnelAction::None => {}
+        }
+        Ok(None)
+    }
+
+    async fn handle_runtime_output<T>(
+        output: Option<ClientOutput>,
+        client_id: ClientId,
+        transport: &mut T,
+    ) -> Result<Option<RuntimeTunnelBridgeOutcome>, TunnelError>
+    where
+        T: TunnelTransport,
+    {
+        let Some(output) = output else {
+            return Ok(Some(RuntimeTunnelBridgeOutcome::RuntimeStopped));
+        };
+        let is_closed = matches!(output, ClientOutput::Closed(_));
+        let frame = Self::frame_from_output(Some(client_id), output)?;
+        transport.send_frame(frame).await?;
+        if is_closed {
+            Ok(Some(RuntimeTunnelBridgeOutcome::RuntimeStopped))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn send_runtime_command(
+        commands: &tokio_mpsc::Sender<RuntimeCommand>,
+        command: RuntimeCommand,
+    ) -> Result<(), TunnelError> {
+        commands
+            .send(command)
+            .await
+            .map_err(|_error: SendError<RuntimeCommand>| TunnelError::RuntimeCommandChannelClosed)
+    }
+
     /// Converts a tunnel frame into a runtime-side action.
     #[must_use]
     pub fn action_from_frame(frame: TunnelFrame) -> RuntimeTunnelAction {
@@ -362,6 +498,25 @@ impl RuntimeTunnelBridge {
 mod tests {
     use super::*;
     use crate::protocol::{LeaseOwner, ServerControlMessage};
+
+    #[derive(Debug)]
+    struct MemoryTunnelTransport {
+        inbound: tokio_mpsc::Receiver<TunnelFrame>,
+        outbound: tokio_mpsc::Sender<TunnelFrame>,
+    }
+
+    impl TunnelTransport for MemoryTunnelTransport {
+        async fn send_frame(&mut self, frame: TunnelFrame) -> Result<(), TunnelError> {
+            self.outbound
+                .send(frame)
+                .await
+                .map_err(|_error| TunnelError::TransportClosed)
+        }
+
+        async fn receive_frame(&mut self) -> Result<Option<TunnelFrame>, TunnelError> {
+            Ok(self.inbound.recv().await)
+        }
+    }
 
     #[test]
     fn test_should_round_trip_json_tunnel_frame() -> anyhow::Result<()> {
@@ -452,6 +607,103 @@ mod tests {
                 },
             }
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_should_run_bridge_attach_input_output_and_detach() -> anyhow::Result<()> {
+        let client_id = ClientId::new(11);
+        let (inbound_tx, inbound_rx) = tokio_mpsc::channel(8);
+        let (outbound_tx, mut outbound_rx) = tokio_mpsc::channel(8);
+        let (command_tx, mut command_rx) = tokio_mpsc::channel(8);
+        let transport = MemoryTunnelTransport {
+            inbound: inbound_rx,
+            outbound: outbound_tx,
+        };
+        let bridge = tokio::spawn(RuntimeTunnelBridge::run(transport, command_tx));
+
+        inbound_tx
+            .send(TunnelFrame::AttachBrowser { client_id })
+            .await?;
+        let Some(RuntimeCommand::AttachClient {
+            client_id: attached_id,
+            output,
+        }) = command_rx.recv().await
+        else {
+            anyhow::bail!("expected attach command");
+        };
+        assert_eq!(attached_id, client_id);
+
+        output
+            .send(ClientOutput::Bytes(Bytes::from_static(b"runtime-output")))
+            .await?;
+        let Some(TunnelFrame::PtyOutput { bytes }) = outbound_rx.recv().await else {
+            anyhow::bail!("expected pty output frame");
+        };
+        assert_eq!(bytes.as_bytes(), b"runtime-output");
+
+        inbound_tx
+            .send(TunnelFrame::BrowserInput {
+                client_id,
+                bytes: TunnelTerminalPayload::new(Bytes::from_static(b"browser-input"))?,
+            })
+            .await?;
+        let Some(RuntimeCommand::Input {
+            client_id: input_id,
+            bytes,
+        }) = command_rx.recv().await
+        else {
+            anyhow::bail!("expected input command");
+        };
+        assert_eq!(input_id, client_id);
+        assert_eq!(bytes, Bytes::from_static(b"browser-input"));
+
+        drop(inbound_tx);
+        let outcome = bridge.await??;
+        assert_eq!(outcome, RuntimeTunnelBridgeOutcome::TransportClosed);
+        let Some(RuntimeCommand::DetachClient {
+            client_id: detached_id,
+        }) = command_rx.recv().await
+        else {
+            anyhow::bail!("expected detach command");
+        };
+        assert_eq!(detached_id, client_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_should_stop_bridge_after_runtime_closed_output() -> anyhow::Result<()> {
+        let client_id = ClientId::new(12);
+        let (inbound_tx, inbound_rx) = tokio_mpsc::channel(8);
+        let (outbound_tx, mut outbound_rx) = tokio_mpsc::channel(8);
+        let (command_tx, mut command_rx) = tokio_mpsc::channel(8);
+        let transport = MemoryTunnelTransport {
+            inbound: inbound_rx,
+            outbound: outbound_tx,
+        };
+        let bridge = tokio::spawn(RuntimeTunnelBridge::run(transport, command_tx));
+
+        inbound_tx
+            .send(TunnelFrame::AttachBrowser { client_id })
+            .await?;
+        let Some(RuntimeCommand::AttachClient { output, .. }) = command_rx.recv().await else {
+            anyhow::bail!("expected attach command");
+        };
+        output
+            .send(ClientOutput::Closed(ShutdownReason::ChildExit))
+            .await?;
+
+        let Some(TunnelFrame::RuntimeControl { control, .. }) = outbound_rx.recv().await else {
+            anyhow::bail!("expected runtime control frame");
+        };
+        assert_eq!(
+            control,
+            TunnelRuntimeControl::Closed {
+                reason: TunnelCloseReason::ChildExit,
+            }
+        );
+        let outcome = bridge.await??;
+        assert_eq!(outcome, RuntimeTunnelBridgeOutcome::RuntimeStopped);
         Ok(())
     }
 }
