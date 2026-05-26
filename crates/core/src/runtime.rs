@@ -16,6 +16,7 @@ use std::{
 
 use bytes::Bytes;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, SlavePty, native_pty_system};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc::{self as tokio_mpsc, error::TrySendError};
 use tracing::warn;
@@ -73,7 +74,7 @@ pub enum RuntimeError {
 }
 
 /// Browser/client identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub struct ClientId(u64);
 
 impl ClientId {
