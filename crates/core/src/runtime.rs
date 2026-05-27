@@ -1631,9 +1631,11 @@ mod tests {
             })
             .context("missing replay finished marker")?;
         assert!(replay_started_index < replay_finished_index);
+        let replay_contents = messages
+            .get(replay_started_index + 1..replay_finished_index)
+            .context("invalid replay marker range")?;
         assert!(
-            messages[replay_started_index + 1..replay_finished_index]
-                .iter()
+            replay_contents.iter()
                 .any(|message| matches!(message, ClientOutput::Bytes(bytes) if bytes.windows(b"replay-marker".len()).any(|window| window == b"replay-marker")))
         );
         session.shutdown(ShutdownReason::Supervisor).await?;

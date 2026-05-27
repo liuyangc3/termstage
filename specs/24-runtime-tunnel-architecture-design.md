@@ -84,9 +84,14 @@ single `termstage` process
 ┌────────────────────────────────────────────────────────────────────┐
 │ Embedded web server                                                 │
 │                                                                    │
-│  Browser /ws ◀──── route by session/controller ────▶ /tunnel/ws    │
+│  Browser /ws ◀──── browser protocol adapter                         │
+│       │                                                            │
+│       ▼                                                            │
+│  in-process TunnelTransport                                        │
+│                                                                    │
+│  /tunnel/ws ───── WebSocket TunnelTransport                         │
 └──────────────────────────────────────▲─────────────────────────────┘
-                                       │ loopback WebSocket transport
+                                       │ TunnelFrame transport
 ┌──────────────────────────────────────┴─────────────────────────────┐
 │ Local tunnel client / RuntimeTunnelBridge                           │
 │ - WebSocket transport implementation                                │
@@ -108,7 +113,7 @@ Current embedded server route state:
 | --- | --- | --- |
 | `/` | Serves the browser terminal page. | Existing behavior, unchanged. |
 | `/assets/*` | Serves browser JavaScript, CSS, fonts, and static assets. | Existing behavior, unchanged. |
-| `/ws` | Existing browser terminal WebSocket used by the page. | Kept compatible during the migration. |
+| `/ws` | Existing browser terminal WebSocket used by the page. | Browser protocol adapter backed by `TunnelFrame`. |
 | `/tunnel/ws` | WebSocket transport endpoint for `TunnelFrame`. | Added as the first transport-backed runtime bridge endpoint. |
 | `/healthz` | Health check. | Existing behavior, unchanged. |
 
@@ -220,7 +225,8 @@ tunnel endpoint while preserving the existing browser-facing UX.
 Required behavior:
 
 1. Browser URL shape remains compatible with today.
-2. Browser `/ws` still accepts the existing browser protocol.
+2. Browser `/ws` still accepts the existing browser protocol, but translates
+   attach/input/resize/detach through `TunnelFrame`.
 3. `/tunnel/ws` accepts authenticated WebSocket upgrades and speaks
    `TunnelFrame` over the first WebSocket transport implementation.
 4. A tunnel bridge connected to `/tunnel/ws` can translate frames to
@@ -236,7 +242,12 @@ Final state for this spec:
 ```text
 Browser page
   -> /ws existing browser protocol
-  -> embedded web tunnel boundary
+  -> embedded browser protocol adapter
+  -> in-process TunnelTransport
+  -> RuntimeTunnelBridge
+  -> RuntimeSession / SessionActor
+
+External tunnel clients
   -> /tunnel/ws WebSocket transport
   -> RuntimeTunnelBridge
   -> RuntimeSession / SessionActor
@@ -298,22 +309,14 @@ Exit criteria:
 
 - Implement `TunnelTransport` for WebSocket.
 - Add the embedded tunnel route, for example `/tunnel/ws`.
-- Start a loopback local tunnel client from the main command after the web server
-  binds.
+- Keep the browser-facing `/ws` route unchanged until Phase 4.
 
 Exit criteria:
 
-- One browser session can drive a shell command through:
-
-```text
-browser /ws
-  -> embedded web tunnel hub
-  -> loopback WebSocket transport
-  -> RuntimeTunnelBridge
-  -> RuntimeSession
-```
-
-- PTY output returns through the reverse path and renders in xterm.js.
+- The embedded `/tunnel/ws` route accepts authenticated `TunnelFrame`
+  WebSocket connections.
+- A tunnel WebSocket client can forward a browser-side frame to
+  `RuntimeTunnelBridge` and then to `RuntimeSession`.
 
 ### Phase 4: Replace Direct Web Runtime Path
 
@@ -323,6 +326,17 @@ browser /ws
 
 Exit criteria:
 
+- One browser session can drive a shell command through:
+
+```text
+browser /ws
+  -> embedded browser protocol adapter
+  -> TunnelTransport
+  -> RuntimeTunnelBridge
+  -> RuntimeSession
+```
+
+- PTY output returns through the reverse path and renders in xterm.js.
 - Browser refresh replay, resize, process-exit notification, and input lease
   behavior match the direct-channel implementation.
 - Existing browser tests pass through the tunnel path.
@@ -339,7 +353,7 @@ Exit criteria:
 - Serialization: control frames use `serde`, `camelCase`, and
   `deny_unknown_fields`.
 - Testing: unit tests for frame validation and bridge mappings; integration tests
-  for embedded web server plus loopback tunnel client.
+  for embedded web server plus tunnel transports.
 - Observability: structured `tracing` spans for tunnel connect, attach, detach,
   frame validation failure, backpressure close, and shutdown.
 - Performance: use `Bytes` for terminal payloads and avoid copying terminal data

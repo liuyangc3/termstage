@@ -556,7 +556,7 @@ mod tests {
             bytes,
         }) = RuntimeTunnelBridge::action_from_frame(frame)
         else {
-            panic!("expected runtime input command");
+            anyhow::bail!("expected runtime input command");
         };
 
         assert_eq!(id, client_id);
