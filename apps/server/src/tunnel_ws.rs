@@ -178,7 +178,7 @@ mod tests {
         let close = socket.next().await;
         assert!(matches!(
             close,
-            None | Some(Ok(TungsteniteMessage::Close(_))) | Some(Err(_))
+            None | Some(Ok(TungsteniteMessage::Close(_)) | Err(_))
         ));
         assert!(received.lock().await.is_empty());
         server.abort();

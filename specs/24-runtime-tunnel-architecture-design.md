@@ -102,6 +102,21 @@ single `termstage` process
 └────────────────────────────────────────────────────────────────────┘
 ```
 
+Current embedded server route state:
+
+| Route | Purpose | Status in this spec |
+| --- | --- | --- |
+| `/` | Serves the browser terminal page. | Existing behavior, unchanged. |
+| `/assets/*` | Serves browser JavaScript, CSS, fonts, and static assets. | Existing behavior, unchanged. |
+| `/ws` | Existing browser terminal WebSocket used by the page. | Kept compatible during the migration. |
+| `/tunnel/ws` | WebSocket transport endpoint for `TunnelFrame`. | Added as the first transport-backed runtime bridge endpoint. |
+| `/healthz` | Health check. | Existing behavior, unchanged. |
+
+When `--base-path` is configured, all routes mount below that prefix. For
+example, `--base-path /p/sess-1/` exposes `/p/sess-1/tunnel/ws`. In embedded
+mode the base path remains a reverse-proxy path prefix, not a multi-session
+registry. A single embedded web server still owns one runtime session.
+
 `SessionActor` must not depend on WebSocket, TCP, gRPC, protobuf, HTTP, or any
 transport crate. It continues to receive `RuntimeCommand` and emit
 `ClientOutput`. The bridge owns translation between the runtime model and the
@@ -206,15 +221,30 @@ Required behavior:
 
 1. Browser URL shape remains compatible with today.
 2. Browser `/ws` still accepts the existing browser protocol.
-3. Browser input/output is routed through the tunnel hub instead of directly
-   sending `RuntimeCommand` to `RuntimeSession`.
-4. A local tunnel client dials the embedded tunnel endpoint over loopback
-   WebSocket during startup.
+3. `/tunnel/ws` accepts authenticated WebSocket upgrades and speaks
+   `TunnelFrame` over the first WebSocket transport implementation.
+4. A tunnel bridge connected to `/tunnel/ws` can translate frames to
+   `RuntimeCommand` and runtime output back to frames.
 5. `--base-path` applies consistently to browser routes and tunnel routes.
 6. Public exposure validation remains unchanged.
 
-The web-side tunnel hub depends on `TunnelFrame`, not on runtime internals. This
-is the boundary that a later split-process spec can reuse.
+The web-side tunnel endpoint depends on `TunnelFrame`, not on browser terminal
+frames. This is the boundary that a later split-process spec can reuse.
+
+Final state for this spec:
+
+```text
+Browser page
+  -> /ws existing browser protocol
+  -> embedded web tunnel boundary
+  -> /tunnel/ws WebSocket transport
+  -> RuntimeTunnelBridge
+  -> RuntimeSession / SessionActor
+```
+
+The final state above is still embedded in the main `termstage` process. It does
+not introduce a standalone web server, external gateway, remote agent, OIDC, or
+multi-session registry.
 
 ## 8. Backpressure and Shutdown
 
