@@ -1,8 +1,8 @@
 # 24-runtime-tunnel-architecture: Embedded Runtime Tunnel Layers
 
-Status: draft v1
+Status: implemented
 Owner: termstage
-Last updated: 2026-05-26
+Last updated: 2026-05-27
 Depends on: [10-browser-terminal-protocol-design.md](./10-browser-terminal-protocol-design.md),
 [11-browser-terminal-runtime-design.md](./11-browser-terminal-runtime-design.md),
 [20-browser-terminal-web-design.md](./20-browser-terminal-web-design.md),
@@ -93,8 +93,8 @@ single `termstage` process
 └──────────────────────────────────────▲─────────────────────────────┘
                                        │ TunnelFrame transport
 ┌──────────────────────────────────────┴─────────────────────────────┐
-│ Local tunnel client / RuntimeTunnelBridge                           │
-│ - WebSocket transport implementation                                │
+│ RuntimeTunnelBridge boundary                                        │
+│ - TunnelTransport implementation                                    │
 │ - TunnelFrame encode/decode                                         │
 │ - TunnelFrame <-> RuntimeCommand / ClientOutput                     │
 └──────────────────────────────────────▲─────────────────────────────┘
@@ -121,6 +121,17 @@ When `--base-path` is configured, all routes mount below that prefix. For
 example, `--base-path /p/sess-1/` exposes `/p/sess-1/tunnel/ws`. In embedded
 mode the base path remains a reverse-proxy path prefix, not a multi-session
 registry. A single embedded web server still owns one runtime session.
+
+Implementation status:
+
+- `RuntimeSession` and `SessionActor` remain the only PTY and child-process
+  owners.
+- Browser `/ws` is now a browser protocol adapter backed by an in-process
+  `TunnelTransport`.
+- `/tunnel/ws` is the first external `TunnelTransport` implementation and
+  accepts authenticated `TunnelFrame` WebSocket connections.
+- The embedded web server still starts from the main command. CLI flags and
+  launch URLs remain compatible.
 
 `SessionActor` must not depend on WebSocket, TCP, gRPC, protobuf, HTTP, or any
 transport crate. It continues to receive `RuntimeCommand` and emit
@@ -279,7 +290,7 @@ Shutdown rules:
 
 ## 9. Implementation Plan
 
-This is a refactor plan for embedded mode.
+This refactor plan for embedded mode has been implemented.
 
 ### Phase 1: Protocol Types
 
@@ -293,6 +304,8 @@ Exit criteria:
 - No runtime or web behavior changes.
 - Unit tests cover encode/decode and validation failure cases.
 
+Status: complete.
+
 ### Phase 2: Runtime Bridge
 
 - Add `RuntimeTunnelBridge`.
@@ -304,6 +317,8 @@ Exit criteria:
 
 - Unit tests cover bridge mappings in both directions.
 - Existing direct web/runtime path still works.
+
+Status: complete.
 
 ### Phase 3: WebSocket Transport
 
@@ -317,6 +332,8 @@ Exit criteria:
   WebSocket connections.
 - A tunnel WebSocket client can forward a browser-side frame to
   `RuntimeTunnelBridge` and then to `RuntimeSession`.
+
+Status: complete.
 
 ### Phase 4: Replace Direct Web Runtime Path
 
@@ -341,6 +358,8 @@ browser /ws
   behavior match the direct-channel implementation.
 - Existing browser tests pass through the tunnel path.
 
+Status: complete.
+
 ## 10. AGENTS.md Binding
 
 - Error handling: tunnel errors use `thiserror`; binaries add `anyhow::Context`.
@@ -361,16 +380,18 @@ browser /ws
 - Documentation: public tunnel types document lifecycle and failure modes with
   `# Errors`.
 
-## 11. Open Questions
+## 11. Decisions
 
-- What exact JSON/binary envelope should WebSocket use so terminal bytes remain
-  efficient while control frames stay debuggable?
-- Should tunnel mode be an internal default immediately, or initially hidden
-  behind a development flag until parity is proven?
-- Should the embedded tunnel endpoint be `/tunnel/ws`, `/runtime/ws`, or another
-  name that does not imply a separate process yet?
-- How should browser `ClientId` map to tunnel stream ids if future transports
-  multiplex multiple browser clients over one tunnel?
+- WebSocket tunnel frames use the JSON codec in this spec. A later transport
+  optimization may add a binary envelope without changing `RuntimeTunnelBridge`
+  or `SessionActor`.
+- Tunnel mode is internal default behavior for the embedded browser path. No
+  user-facing feature flag is required.
+- The embedded tunnel endpoint is `/tunnel/ws`. With `--base-path`, it mounts
+  below the prefix exactly like the browser routes.
+- In this embedded spec, one browser WebSocket maps to one `ClientId` and one
+  bridge-owned runtime mailbox. Multiplexed stream ids are deferred to a future
+  multi-client or split-process spec.
 
 ## 12. Cross-References
 
